@@ -1,0 +1,184 @@
+#define FILTER_SIZE 9 // 필터 전체 크기 정의
+#define FILTER_SIDE 3 // 필터 한변 길이 정의
+#define MAXPOOL_SIDE 2 // 맥스풀링할때 필터의 한변 길이 정의
+
+__kernel void conv(
+    __global float* input,// 입력이미지 10장 한번에 들어온다 4차원이다.
+    __global float* weight, // 직렬화된 필터, 3x3 마다 다르다.
+    __global float* bias, // 직렬화된 편향 출력채널 마다 다르다. 입력채널 0~2 까지 연산하는동안은 같다. 한 그룹내에서 같다는 소리. 필터 개수만큼 있음
+    __global float* output, // 출력피쳐맵 10장에 대해서 한번에 나간다 4차원이다.
+    const int inDim, // 입력 이미지의 채널수
+    const int outDim, // 출력되는 피쳐맵의 채널수
+    const int NBYN, // 출력되는 가로세로 길이
+    __local float* IMG_SUB,
+    __local float* FILTER_SUB
+) {
+    const int IMGNUM = get_global_id(2); // 배치축에서 id 가져오기 이미지 번호 0, 1, 2, 3..., 9
+    const int LOCALID = get_local_id(1); // 한 그룹 내에서 그룹내의 인덱스 가져오기 0, 1, 2 (입력채널 3개이므로)
+    const int ITEM_GLOBAL_X = get_global_id(0) % NBYN; // 3x3의 시작위치를 계산하기 위해 워크그룹의 0차원을 한 사이드로 나눈 나머지
+    const int ITEM_GLOBAL_Y = get_global_id(0) / NBYN; // 3x3의 시작위치를 계산하기 위해 워크그룹의 0차원을 한 사이드로 나눈 몫
+    const int OUT_CH_ID = get_group_id(1); // 출력채널수만큼 나온다. 그룹아이디 0, 1, 2..., 63
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // 로컬변수 선언부
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // 로컬변수 사이즈를 설정해야 한다.
+    // 최초 컨볼루션에서는 3채널에 필터크기는 9 이다.
+    const int IMG_SUB_SIZE = inDim * FILTER_SIZE;
+    //__local float IMG_SUB[IMG_SUB_SIZE]; // IMG_SUB[27] 의 크기로 선언된다.
+    // 패딩을 구현하기 위해 이미지 그룹의 모든 메모리를 0으로 초기화한다.
+    for (int i = 0; i < IMG_SUB_SIZE; i++) {
+        IMG_SUB[i] = 0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int FILTER_SUB_SIZE = inDim * FILTER_SIZE;
+
+    __local float BIAS_SUB; // 바이아스 선언
+
+    __local float LOCAL_SUM; // 로컬 합 담는 변수 선언
+    if (LOCALID == 0) {
+        LOCAL_SUM = 0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // 글로벌 메모리에 있는 데이터 로컬 메모리에 집어넣기
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // 글로벌 메모리의 이미지를 로컬 메모리로 불러오는 코드블록
+    // 9개의 합성곱을 다루는 워킹아이템이 1개이기 때문에 9개짜리 부분은 무조건 순차처리 해야한다.
+    // 조건문을 통해 패딩이 저장되게 구현한다.
+    for (int FILTER_ROW = 0; FILTER_ROW < FILTER_SIDE; FILTER_ROW++) {
+        for (int FILTER_COL = 0; FILTER_COL < FILTER_SIDE; FILTER_COL++) {
+            int x = ITEM_GLOBAL_X + FILTER_COL - 1;
+            int y = ITEM_GLOBAL_Y + FILTER_ROW - 1;
+            if (x >= 0 && x < NBYN && y >= 0 && y < NBYN) {
+                IMG_SUB[(FILTER_SIDE * FILTER_SIDE * LOCALID) + (FILTER_SIDE * FILTER_ROW) + (FILTER_COL)] = input[(inDim * NBYN * NBYN * IMGNUM) + (NBYN * NBYN * LOCALID) + (NBYN * y) + (x)];
+            }
+            
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 글로벌 메모리의 필터를 로컬 메모리로 불러오는 코드블록
+    // 3x3 필터를 다루는 워킹아이템이 1개이므로 9번 순차처리 해야 한다.
+    for (int FILTER_ROW = 0; FILTER_ROW < FILTER_SIDE; FILTER_ROW++) {
+        for (int FILTER_COL = 0; FILTER_COL < FILTER_SIDE; FILTER_COL++) {
+            //FILTER_SUB[(FILTER_SIDE * FILTER_SIDE * LOCALID) + (FILTER_SIDE * FILTER_ROW) + (FILTER_COL)] = weight[(inDim * FILTER_SIDE * FILTER_SIDE * IMGNUM) + (FILTER_SIDE * FILTER_SIDE * LOCALID * OUT_CH_ID) + (FILTER_SIDE * FILTER_ROW) + (FILTER_COL)];
+            FILTER_SUB[(FILTER_SIDE * FILTER_SIDE * LOCALID) + (FILTER_SIDE * FILTER_ROW) + (FILTER_COL)] = weight[(OUT_CH_ID * inDim * FILTER_SIDE * FILTER_SIDE) + (FILTER_SIDE * FILTER_SIDE * LOCALID) + (FILTER_SIDE * FILTER_ROW) + (FILTER_COL)];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+
+    // 글로벌 메모리의 bias를 로컬 메모리로 불러오는 코드블록
+    BIAS_SUB = bias[OUT_CH_ID];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // 로컬 메모리에 있는 데이터 연산해서 3개의 PRIVATE_SUM에 저장 후 LOCAL_SUM 에 모두 더한다.
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    __private float PRIVATE_SUM = 0.0f;
+
+    for (int FILTER_ROW = 0; FILTER_ROW < FILTER_SIDE; FILTER_ROW++) {
+        for (int FILTER_COL = 0; FILTER_COL < FILTER_SIDE; FILTER_COL++) {
+            PRIVATE_SUM += FILTER_SUB[(FILTER_SIDE * FILTER_SIDE * LOCALID) + (FILTER_SIDE * FILTER_ROW) + (FILTER_COL)] * IMG_SUB[(FILTER_SIDE * FILTER_SIDE * LOCALID) + (FILTER_SIDE * FILTER_ROW) + (FILTER_COL)];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int i = 0; i < inDim; i++) {
+        if (LOCALID == i) {
+            LOCAL_SUM += PRIVATE_SUM;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    
+    
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// LOCAL_SUM 에 BIAS를 더하고 ReLU를 통과시킨 다음 output에 집어넣는다.
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    if (LOCALID == 0) {
+        LOCAL_SUM += BIAS_SUB;
+        if (LOCAL_SUM < 0) { // ReLU
+            LOCAL_SUM = 0;
+        }
+        output[(outDim * NBYN * NBYN * IMGNUM) + (NBYN * NBYN * OUT_CH_ID) + (NBYN * ITEM_GLOBAL_Y) + (ITEM_GLOBAL_X)] = LOCAL_SUM;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
+__kernel void maxPooling(
+    __global float* input,
+    __global float* output,
+    const int inDim,
+    const int NBYN,
+    __local float* MAXPOOL_SUB
+) {
+    const int IMGNUM = get_global_id(2); // 배치축에서 id 가져오기 이미지 번호 0, 1, 2, 3..., 9
+    const int LOCALID = get_local_id(1); // 한 그룹 내에서 그룹내의 인덱스 가져오기 0, 1, 2 (입력채널 3개이므로)
+    const int ITEM_GLOBAL_X = get_global_id(0) % NBYN; // 3x3의 시작위치를 계산하기 위해 워크그룹의 0차원을 한 사이드로 나눈 나머지
+    const int ITEM_GLOBAL_Y = get_global_id(0) / NBYN; // 3x3의 시작위치를 계산하기 위해 워크그룹의 0차원을 한 사이드로 나눈 몫
+    const int OUT_CH_ID = get_group_id(1); // 출력채널수만큼 나온다. 그룹아이디 0, 1, 2..., 63
+
+    for (int FILTER_ROW = 0; FILTER_ROW < MAXPOOL_SIDE; FILTER_ROW++) {
+        for (int FILTER_COL = 0; FILTER_COL < MAXPOOL_SIDE; FILTER_COL++) {
+            int x = (2 * ITEM_GLOBAL_X) + FILTER_COL;
+            int y = (2 * ITEM_GLOBAL_Y) + FILTER_ROW;
+            MAXPOOL_SUB[(MAXPOOL_SIDE * FILTER_ROW) + (FILTER_COL)] = input[(inDim * (NBYN * 2) * (NBYN * 2) * IMGNUM) + ((NBYN * 2) * (NBYN * 2) * OUT_CH_ID) + ((NBYN * 2) * y) + (x)];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float max = 0.0f;
+    for (int FILTER_ROW = 0; FILTER_ROW < MAXPOOL_SIDE; FILTER_ROW++) {
+        for (int FILTER_COL = 0; FILTER_COL < MAXPOOL_SIDE; FILTER_COL++) {
+            if (max < MAXPOOL_SUB[(MAXPOOL_SIDE * FILTER_ROW) + (FILTER_COL)]) {
+                max = MAXPOOL_SUB[(MAXPOOL_SIDE * FILTER_ROW) + (FILTER_COL)];
+            }
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    output[(inDim * NBYN * NBYN * IMGNUM) + (NBYN * NBYN * OUT_CH_ID) + (NBYN * ITEM_GLOBAL_Y) + ITEM_GLOBAL_X] = max;
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
+__kernel void fcLayer(
+    __global float* input,
+    __global float* output,
+    __global float* weight,
+    __global float* bias,
+    const int inDim,
+    const int outDim,
+    const int NBYN
+) {
+    const int IMGNUM = get_global_id(2); // 배치축에서 id 가져오기 이미지 번호 0, 1, 2, 3..., 9
+    const int LOCALID = get_local_id(1); // 한 그룹 내에서 그룹내의 인덱스 가져오기 0, 1, 2 (입력채널 3개이므로)
+    const int ITEM_GLOBAL_X = get_global_id(0) % NBYN; // 3x3의 시작위치를 계산하기 위해 워크그룹의 0차원을 한 사이드로 나눈 나머지
+    const int ITEM_GLOBAL_Y = get_global_id(0) / NBYN; // 3x3의 시작위치를 계산하기 위해 워크그룹의 0차원을 한 사이드로 나눈 몫
+    const int OUT_CH_ID = get_group_id(1); // 출력채널수만큼 나온다. 그룹아이디 0, 1, 2..., 63
+    const int LOCAL_AXIS0 = get_global_id(0) % outDim;
+
+    float gop = 0.0f;
+    __local float LOCAL_SUM;
+    LOCAL_SUM = 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    gop = input[(inDim * IMGNUM) + LOCALID] * weight[(inDim * LOCAL_AXIS0) + LOCALID];
+    for (int i = 0; i < inDim; i++) {
+        if (LOCALID == i) {
+            LOCAL_SUM += gop;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (LOCALID == 0) {
+        LOCAL_SUM += bias[LOCAL_AXIS0];
+        if (LOCAL_SUM < 0) { // ReLU
+            LOCAL_SUM = 0;
+        }
+        output[(outDim * IMGNUM) + LOCAL_AXIS0] = LOCAL_SUM;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
